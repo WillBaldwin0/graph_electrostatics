@@ -10,7 +10,7 @@ using this we construct a smooth charge density $\rho$. Given a single $n$, corr
 
 $$\rho(\mathbf{r}) = \sum_{ilm} p_{ilm} \phi_{nlm}(\mathbf{r}-\mathbf{r}_i)$$
 
-Varying $n$ controls the smoothness of the density and provides Coulomb energy damping at short distances. 
+Varying $n$ controls the smoothness of the density and provides Coulomb energy damping at short distances.
 
 ## electrostatic energy
 

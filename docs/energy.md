@@ -72,7 +72,7 @@ basis (see `docs/maths/densities_and_projections.md` for the full derivation).
 ### Periodic (k-space) evaluation
 
 For periodic systems, the code uses Fourier series coefficients on the reciprocal lattice
-to compute the energy efficiently.
+to compute the energy efficiently. The background for derviations is in `docs/maths/`.
 
 1. Build the density coefficients:
 

@@ -88,6 +88,8 @@ are produced in a different basis.
 
 ## Implementation
 
+The background for derviations is in `docs/maths/`.
+
 ### Definition
 
 The electrostatic potential is
