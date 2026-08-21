@@ -7,6 +7,29 @@ import torch
 from graph_longrange.gto_utils import GTOBasis
 
 
+def test_gto_basis_direct_has_finite_k_vector_gradients():
+    torch.set_default_dtype(torch.float64)
+    k_vectors = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.4, -0.2, 0.1], [-0.1, 0.3, 0.5]],
+        requires_grad=True,
+    )
+    k_norm2 = torch.sum(k_vectors.square(), dim=-1)
+    k0_mask = torch.tensor([1.0, 0.0, 0.0])
+    basis = GTOBasis(
+        max_l=1,
+        sigmas=[0.5, 1.0],
+        kspace_cutoff=3.0,
+        normalize="multipoles",
+        use_spline=False,
+    )
+
+    values = basis(k_vectors, k_norm2, k0_mask)
+    gradient = torch.autograd.grad(values.square().sum(), k_vectors)[0]
+
+    assert torch.isfinite(gradient).all()
+    assert torch.linalg.vector_norm(gradient[1:]) > 0.0
+
+
 @pytest.mark.parametrize("rtol, atol", [(1e-15, 1e-15)])
 def test_gto_basis_matches_old_reference(rtol, atol):
     torch.set_default_dtype(torch.float64)
