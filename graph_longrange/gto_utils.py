@@ -38,14 +38,9 @@ class RadialIntegralDirect(torch.nn.Module):
             out = self.pref0 * exp_term
             return out.unsqueeze(-1)
 
-        out = torch.empty(
-            (*k_mods.shape, self.num_sigma, 2),
-            dtype=k_mods.dtype,
-            device=k_mods.device,
-        )
-        torch.mul(self.pref0, exp_term, out=out[..., 0])
-        torch.mul(self.pref1, k_mods.unsqueeze(-1) * exp_term, out=out[..., 1])
-        return out
+        radial_l0 = self.pref0 * exp_term
+        radial_l1 = self.pref1 * k_mods.unsqueeze(-1) * exp_term
+        return torch.stack((radial_l0, radial_l1), dim=-1)
 
 
 def _normalization_denominator(
@@ -145,9 +140,10 @@ class GTOBasis(torch.nn.Module):
     def _prepare_k_moduli(
         self, k_norm2: torch.Tensor, k0_mask: torch.Tensor
     ) -> torch.Tensor:
-        k_moduli = torch.sqrt(torch.clamp_min(k_norm2, 0.0))
-        k_moduli.masked_fill_(k0_mask > 0.0, 0.0)
-        return k_moduli
+        is_k0 = k0_mask > 0.0
+        safe_k_norm2 = k_norm2.masked_fill(is_k0, 1.0)
+        k_moduli = torch.sqrt(torch.clamp_min(safe_k_norm2, 0.0))
+        return k_moduli.masked_fill(is_k0, 0.0)
 
     def _compute_ylmk(self, k_vectors: torch.Tensor) -> torch.Tensor:
         k_vectors = torch.index_select(k_vectors, -1, self.permute_indices)
