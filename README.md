@@ -10,9 +10,6 @@
 - [x] Efficient **batching** for pytorch training
 - [x] Considerable **precopmutation** for electrostatic features to speed up self-consistent-field loops
 - [x] Interpolation functions for probing the potential and density around atomistic systems
-
-Additional functionality will also be coming in the near future, including:
-
-- [ ] Confined Jellium slabs of charge, useful when simulating electrochemical interfaces
+- [x] Confined Jellium slabs of charge, useful when simulating electrochemical interfaces
 
 This repo currently supports several long-range MLIP architectures including the MACE-POLAR-1 foundation model.

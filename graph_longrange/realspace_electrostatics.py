@@ -134,7 +134,7 @@ class RealSpaceFiniteDiffereneEnergy(torch.nn.Module):
 
     def energy_l0(
         self,
-        source_feats: torch.Tensor,  # [n_node, 1]
+        source_feats: torch.Tensor,  # [n_node, (max_l_s+1)**2]
         positions: torch.Tensor,  # [n_node, 3]
         batch: torch.Tensor,  # [n_node]
     ) -> torch.Tensor:
@@ -360,11 +360,8 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
             total_width_factors=self.total_width_factors.unsqueeze(0),
         )  # [all_nodes, num_radial]
 
-        all_features = torch.zeros(
-            batch.size(0),
-            4 * self.num_radial,
-            dtype=torch.get_default_dtype(),
-            device=batch.device,
+        all_features = source_feats.new_zeros(
+            (batch.size(0), 4 * self.num_radial)
         )
 
         all_features[:, : self.num_radial] = self.l0_factors * scalar_features[0::4]
@@ -382,17 +379,17 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
 
     def forward(
         self,
-        source_feats: torch.Tensor,  # [n_nodes, 1, (max_l_s+1)**2]
+        source_feats: torch.Tensor,  # [n_nodes, (max_l_s+1)**2]
         node_positions: torch.Tensor,
         batch: torch.Tensor,
     ) -> torch.Tensor:
         if self.density_max_l == 0 and self.projection_max_l == 0:
             features = self.call_density_0_feats_0(
-                source_feats.squeeze(-2), node_positions, batch
+                source_feats, node_positions, batch
             )
         elif self.density_max_l == 1 and self.projection_max_l == 0:
             all_feats = self.call_density_1_feats_1(
-                source_feats.squeeze(-2), node_positions, batch
+                source_feats, node_positions, batch
             )
             features = all_feats[:, : self.num_radial]
         elif self.density_max_l == 0 and self.projection_max_l == 1:
@@ -402,16 +399,16 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
                 dtype=source_feats.dtype,
                 device=source_feats.device,
             )
-            padded_source_feats[:, 0] = source_feats[:, 0, 0]
+            padded_source_feats[:, 0] = source_feats[:, 0]
             features = self.call_density_1_feats_1(
                 padded_source_feats, node_positions, batch
             )
         else:
             features = self.call_density_1_feats_1(
-                source_feats.squeeze(-2), node_positions, batch
+                source_feats, node_positions, batch
             )
 
-        self_interaction_terms = self.self_interaction(source_feats.squeeze(-2))
+        self_interaction_terms = self.self_interaction(source_feats)
         if self.include_self_interaction:
             features += self_interaction_terms
 

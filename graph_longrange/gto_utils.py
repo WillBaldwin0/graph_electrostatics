@@ -38,14 +38,13 @@ class RadialIntegralDirect(torch.nn.Module):
             out = self.pref0 * exp_term
             return out.unsqueeze(-1)
 
-        out = torch.empty(
-            (*k_mods.shape, self.num_sigma, 2),
-            dtype=k_mods.dtype,
-            device=k_mods.device,
+        return torch.stack(
+            (
+                self.pref0 * exp_term,
+                self.pref1 * k_mods.unsqueeze(-1) * exp_term,
+            ),
+            dim=-1,
         )
-        torch.mul(self.pref0, exp_term, out=out[..., 0])
-        torch.mul(self.pref1, k_mods.unsqueeze(-1) * exp_term, out=out[..., 1])
-        return out
 
 
 def _normalization_denominator(
@@ -145,11 +144,23 @@ class GTOBasis(torch.nn.Module):
     def _prepare_k_moduli(
         self, k_norm2: torch.Tensor, k0_mask: torch.Tensor
     ) -> torch.Tensor:
-        k_moduli = torch.sqrt(torch.clamp_min(k_norm2, 0.0))
-        k_moduli.masked_fill_(k0_mask > 0.0, 0.0)
-        return k_moduli
+        safe_k_norm2 = torch.where(
+            k0_mask > 0.0,
+            torch.ones_like(k_norm2),
+            torch.clamp_min(k_norm2, 0.0),
+        )
+        k_moduli = torch.sqrt(safe_k_norm2)
+        return torch.where(k0_mask > 0.0, torch.zeros_like(k_moduli), k_moduli)
 
-    def _compute_ylmk(self, k_vectors: torch.Tensor) -> torch.Tensor:
+    def _compute_ylmk(
+        self, k_vectors: torch.Tensor, k0_mask: torch.Tensor
+    ) -> torch.Tensor:
+        replacement = torch.tensor(
+            [1.0, 0.0, 0.0], dtype=k_vectors.dtype, device=k_vectors.device
+        )
+        k_vectors = torch.where(
+            (k0_mask > 0.0).unsqueeze(-1), replacement, k_vectors
+        )
         k_vectors = torch.index_select(k_vectors, -1, self.permute_indices)
         return self.spherical_harmonics(k_vectors)
 
@@ -160,12 +171,13 @@ class GTOBasis(torch.nn.Module):
         expanded_fnlk = torch.index_select(fnlk, -1, self.expanded_l_indices)
         xnlk = expanded_fnlk * yklm.unsqueeze(-2)
 
-        fourier_coefficients = torch.empty(
-            (*xnlk.size(), 2), dtype=xnlk.dtype, layout=xnlk.layout, device=xnlk.device
+        return torch.stack(
+            (
+                xnlk * self.real_phase_factors,
+                xnlk * self.imag_phase_factors,
+            ),
+            dim=-1,
         )
-        fourier_coefficients[..., 0] = xnlk * self.real_phase_factors
-        fourier_coefficients[..., 1] = xnlk * self.imag_phase_factors
-        return fourier_coefficients
 
     def forward(
         self,
@@ -174,7 +186,7 @@ class GTOBasis(torch.nn.Module):
         k0_mask: torch.Tensor,
     ) -> torch.Tensor:
         k_moduli = self._prepare_k_moduli(k_norm2, k0_mask)
-        yklm = self._compute_ylmk(k_vectors)
+        yklm = self._compute_ylmk(k_vectors, k0_mask)
         return self._evaluate_fourier_basis(k_moduli, yklm)
 
 
@@ -232,6 +244,7 @@ class GTOSelfInteractionBlock(torch.nn.Module):
 
         sh_irreps = o3.Irreps.spherical_harmonics(l_receive)
         self.features_irreps = (sh_irreps * len(sigmas_receive)).sort()[0].simplify()
+        self.features_dim = self.features_irreps.dim
 
         overlap_constants = np.zeros(
             (len(sigmas_receive) * (min(l_receive, l_source) + 1) ** 2)
@@ -292,7 +305,7 @@ class GTOSelfInteractionBlock(torch.nn.Module):
         )
 
         features = torch.zeros(
-            (charge_density.shape[0], self.features_irreps.dim),
+            (charge_density.shape[0], self.features_dim),
             device=charge_density.device,
             dtype=charge_density.dtype,
         )

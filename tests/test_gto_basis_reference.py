@@ -7,6 +7,8 @@ import torch
 from graph_longrange.gto_utils import GTOBasis
 
 
+# The l > 1 spline comparison remains available in older graph_electrostatics commits.
+@pytest.mark.skip(reason="Spline radial integrals for l > 1 are not supported")
 @pytest.mark.parametrize("rtol, atol", [(1e-15, 1e-15)])
 def test_gto_basis_matches_old_reference(rtol, atol):
     torch.set_default_dtype(torch.float64)

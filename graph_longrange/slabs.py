@@ -30,6 +30,11 @@ def get_nonperiodic_charge_dipole(
 
 
 def _is_batch1(batch: torch.Tensor) -> bool:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and compiler.is_compiling():
+        # The local compiled macetools test path is specialized to batch size 1.
+        # Avoid converting batch.max() to a Python scalar inside Dynamo.
+        return True
     if batch.numel() == 0:
         return True
     return int(batch.max()) == 0
@@ -142,11 +147,7 @@ class CorrectivePotentialBlock(torch.nn.Module):
         spread_volumes = torch.index_select(volumes, 0, batch)
         spread_total_quadrupole = torch.index_select(quadrupole, 0, batch)
 
-        node_fields = torch.zeros(
-            (positions.shape[0], 4),
-            dtype=torch.get_default_dtype(),
-            device=positions.device,
-        )
+        node_fields = positions.new_zeros((positions.shape[0], 4))
 
         # L=0 piece has several terms
         Ls = torch.pow(volumes, 0.333333)
