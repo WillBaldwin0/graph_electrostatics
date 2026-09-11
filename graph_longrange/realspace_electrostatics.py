@@ -1,13 +1,129 @@
+import math
+
 import torch
-from scipy.constants import e, epsilon_0, pi
-from mace.tools.scatter import scatter_sum
-from .utils import FIELD_CONSTANT
-from typing import List, Optional, Tuple
-import warnings
+from scipy.constants import pi
+
 from .gto_utils import (
     GTOSelfInteractionBlock,
     get_Cl_sigma,
 )
+from .scatter import scatter_sum
+from .utils import FIELD_CONSTANT
+
+# Sign convention used by the analytical modules (and by charges_energy_from_graph):
+# for every directed edge, separation = positions[receiver] - positions[sender].
+#
+# Component ordering: l=1 coefficients arrive in e3nn order (y, z, x) at feature
+# columns (1, 2, 3). Indexing feature columns with E3NN_TO_CARTESIAN_COLUMNS
+# yields Cartesian (x, y, z); indexing a Cartesian vector's last axis with
+# CARTESIAN_TO_E3NN_COMPONENTS yields e3nn order (y, z, x).
+E3NN_TO_CARTESIAN_COLUMNS = [3, 1, 2]
+CARTESIAN_TO_E3NN_COMPONENTS = [1, 2, 0]
+
+SQRT_TWO_OVER_PI = math.sqrt(2.0 / pi)
+
+# The upward recursion for the smeared-Coulomb kernels suffers catastrophic
+# cancellation for scaled_distance_squared = R^2 / (2 * Sigma^2) << 1, so below
+# this crossover the kernels are evaluated from their Taylor series instead.
+SERIES_CROSSOVER = 0.5
+# Truncation error of the series is bounded by crossover^K / K! with
+# K = SERIES_NUM_TERMS; 13 terms give < 1e-12 at the crossover in float64.
+SERIES_NUM_TERMS = 13
+
+
+def _smeared_coulomb_kernels_series(
+    scaled_distance_squared: torch.Tensor,
+    combined_smearing_width,
+    highest_order: int,
+) -> list[torch.Tensor]:
+    """Taylor-series branch of the smeared-Coulomb kernels (small distances)."""
+    accumulators = [
+        torch.zeros_like(scaled_distance_squared) for _ in range(highest_order + 1)
+    ]
+    term = torch.ones_like(scaled_distance_squared)
+    for k in range(SERIES_NUM_TERMS):
+        for order in range(highest_order + 1):
+            accumulators[order] = accumulators[order] + term / (2 * order + 2 * k + 1)
+        term = term * (-scaled_distance_squared) / (k + 1)
+
+    kernels = []
+    width_power = 1.0 / combined_smearing_width
+    for order in range(highest_order + 1):
+        kernels.append(SQRT_TWO_OVER_PI * width_power * accumulators[order])
+        width_power = width_power / combined_smearing_width**2
+    return kernels
+
+
+def _smeared_coulomb_kernels_closed_form(
+    scaled_distance_squared: torch.Tensor,
+    combined_smearing_width,
+    highest_order: int,
+) -> list[torch.Tensor]:
+    """Closed-form branch of the smeared-Coulomb kernels (well-separated pairs)."""
+    distance = combined_smearing_width * torch.sqrt(2.0 * scaled_distance_squared)
+    distance_squared = 2.0 * scaled_distance_squared * combined_smearing_width**2
+
+    kernels = [torch.erf(torch.sqrt(scaled_distance_squared)) / distance]
+    gaussian_term = (
+        SQRT_TWO_OVER_PI / combined_smearing_width * torch.exp(-scaled_distance_squared)
+    )
+    width_factor = 1.0
+    for order in range(highest_order):
+        kernels.append(
+            ((2 * order + 1) * kernels[-1] - gaussian_term * width_factor)
+            / distance_squared
+        )
+        width_factor = width_factor / combined_smearing_width**2
+    return kernels
+
+
+def smeared_coulomb_kernels(
+    distance_squared: torch.Tensor,
+    combined_smearing_width,
+    highest_order: int,
+) -> list[torch.Tensor]:
+    """Radial kernels of the Coulomb interaction between two Gaussian densities.
+
+    The zeroth kernel is B_0(R) = erf(R / (sqrt(2) * combined_smearing_width)) / R,
+    the interaction of two unit Gaussian charges whose widths combine as
+    combined_smearing_width^2 = width_1^2 + width_2^2. Higher kernels follow the
+    derivative chain B_{n+1}(R) = -(1/R) dB_n/dR, so that dipole interaction
+    tensors are built from B_1 and B_2. All kernels are finite at R = 0.
+
+    Args:
+        distance_squared: squared pair distances, broadcastable against
+            combined_smearing_width (e.g. [n_edges] with a scalar width, or
+            [n_edges, 1] with a [n_radial] width tensor).
+        combined_smearing_width: float or tensor of combined Gaussian widths.
+        highest_order: largest kernel order to return (0, 1, or 2 for l <= 1).
+
+    Returns:
+        List of highest_order + 1 tensors, each broadcast to the common shape.
+    """
+    if highest_order < 0:
+        raise ValueError("highest_order must be non-negative")
+    scaled_distance_squared = distance_squared / (
+        2.0 * combined_smearing_width**2
+    )
+    in_series_branch = scaled_distance_squared < SERIES_CROSSOVER
+    # Clamp each branch's argument into its safe domain before torch.where:
+    # autograd evaluates both branches, and the closed form is singular at R = 0.
+    series_kernels = _smeared_coulomb_kernels_series(
+        torch.clamp(scaled_distance_squared, max=SERIES_CROSSOVER),
+        combined_smearing_width,
+        highest_order,
+    )
+    closed_form_kernels = _smeared_coulomb_kernels_closed_form(
+        torch.clamp(scaled_distance_squared, min=0.5 * SERIES_CROSSOVER),
+        combined_smearing_width,
+        highest_order,
+    )
+    return [
+        torch.where(in_series_branch, series_kernel, closed_form_kernel)
+        for series_kernel, closed_form_kernel in zip(
+            series_kernels, closed_form_kernels
+        )
+    ]
 
 @torch.no_grad()
 def batch_complete_graph_excluding_self_duplicates_vector(
@@ -220,10 +336,12 @@ def charges_features_from_graph(
     """
     Computes the features from a collection of charges, on set of scalar features, considering only specified edges.
     normalization of the charges is multipoles.
+    Uses the module-wide sign convention separation = positions[receiver] - positions[sender]
+    (only the distance enters here, so this matches the historical behaviour exactly).
     """
     num_nodes = positions.shape[0]
     sender, receiver = edge_index
-    R_ij = positions[sender] - positions[receiver]  # [N_edges,3]
+    R_ij = positions[receiver] - positions[sender]  # [N_edges,3]
     d_ij = torch.norm(R_ij, dim=-1, keepdim=True)  # [N_edges,1]
     smooth_reciprocal = torch.erf(0.5 * d_ij / total_width_factors) / (d_ij + 1e-6)
 
@@ -247,7 +365,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         density_max_l: int,
         density_smearing_width: float,
         projection_max_l: int,
-        projection_smearing_widths: List[float],
+        projection_smearing_widths: list[float],
         include_self_interaction=False,
         integral_normalization="receiver",
         offset: float = 0.1,
@@ -411,5 +529,299 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         self_interaction_terms = self.self_interaction(source_feats)
         if self.include_self_interaction:
             features += self_interaction_terms
+
+        return features, self_interaction_terms, None
+
+
+def _validate_source_features(source_feats: torch.Tensor, density_max_l: int) -> None:
+    expected_columns = (density_max_l + 1) ** 2
+    if source_feats.dim() != 2 or source_feats.shape[-1] != expected_columns:
+        raise ValueError(
+            f"source_feats must have shape [n_nodes, {expected_columns}] for "
+            f"density_max_l={density_max_l}, got {tuple(source_feats.shape)}"
+        )
+
+
+class RealSpaceAnalyticalEnergy(torch.nn.Module):
+    """Exact real-space electrostatic energy of Gaussian multipole densities (l <= 1).
+
+    Closed-form replacement for RealSpaceFiniteDiffereneEnergy: dipoles interact
+    through the analytic interaction tensors built from the smeared-Coulomb
+    kernels instead of displaced point charges, so the energy is exactly
+    rotationally invariant at all separations (including overlapping densities).
+
+    Conventions: source_feats are in "multipoles" normalization with l=1
+    components in e3nn order (y, z, x); pair separations are
+    positions[receiver] - positions[sender]; the directed edge sum carries the
+    0.5 double-counting factor and the FIELD_CONSTANT / (4 pi) prefactor.
+    """
+
+    def __init__(
+        self,
+        density_max_l: int,
+        density_smearing_width: float,
+        include_self_interaction: bool = False,
+    ):
+        super().__init__()
+        if density_max_l not in (0, 1):
+            raise ValueError("RealSpaceAnalyticalEnergy only supports l=0 and l=1.")
+        if density_smearing_width <= 0.0:
+            raise ValueError("density_smearing_width must be positive.")
+
+        self.density_max_l = density_max_l
+        self.density_smearing_width = density_smearing_width
+        self.include_self_interaction = include_self_interaction
+        # Both densities carry the same smearing width, so the pair kernel width is
+        # sqrt(width^2 + width^2).
+        self.combined_smearing_width = math.sqrt(2.0) * density_smearing_width
+
+        self.self_interaction = GTOSelfInteractionBlock(
+            density_max_l,
+            density_smearing_width,
+            density_max_l,
+            [density_smearing_width],
+            "multipoles",
+            "multipoles",
+        )
+
+    def forward(
+        self,
+        source_feats: torch.Tensor,  # [n_nodes, (density_max_l+1)**2]
+        positions: torch.Tensor,  # [n_nodes, 3]
+        batch: torch.Tensor,  # [n_nodes]
+    ) -> torch.Tensor:  # [n_graphs]
+        _validate_source_features(source_feats, self.density_max_l)
+        num_nodes = positions.shape[0]
+        num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
+
+        edge_index = batch_complete_graph_excluding_self_duplicates_vector(batch, 1)
+        sender, receiver = edge_index[0], edge_index[1]
+
+        separation = positions[receiver] - positions[sender]  # [n_edges, 3]
+        distance_squared = torch.sum(separation * separation, dim=-1)
+
+        highest_order = 2 if self.density_max_l >= 1 else 0
+        kernels = smeared_coulomb_kernels(
+            distance_squared, self.combined_smearing_width, highest_order
+        )
+
+        charges = source_feats[:, 0]
+        pair_energy = charges[sender] * charges[receiver] * kernels[0]
+
+        if self.density_max_l >= 1:
+            dipoles = source_feats[:, E3NN_TO_CARTESIAN_COLUMNS]  # [n_nodes, 3] (x, y, z)
+            sender_dipoles = dipoles[sender]
+            receiver_dipoles = dipoles[receiver]
+            sender_dipole_along_separation = torch.sum(
+                sender_dipoles * separation, dim=-1
+            )
+            receiver_dipole_along_separation = torch.sum(
+                receiver_dipoles * separation, dim=-1
+            )
+            pair_energy = pair_energy - (
+                charges[sender] * receiver_dipole_along_separation
+                - charges[receiver] * sender_dipole_along_separation
+            ) * kernels[1]
+            pair_energy = (
+                pair_energy
+                + torch.sum(sender_dipoles * receiver_dipoles, dim=-1) * kernels[1]
+            )
+            pair_energy = (
+                pair_energy
+                - sender_dipole_along_separation
+                * receiver_dipole_along_separation
+                * kernels[2]
+            )
+
+        edge_energy = 0.5 * FIELD_CONSTANT / (4 * pi) * pair_energy
+        node_energies = scatter_sum(
+            src=edge_energy, index=receiver, dim=-1, dim_size=num_nodes
+        )
+        energy = scatter_sum(
+            src=node_energies, index=batch, dim=-1, dim_size=num_graphs
+        )
+
+        if self.include_self_interaction:
+            self_fields = self.self_interaction(source_feats)
+            self_node_energies = torch.einsum("nb,nb->n", source_feats, self_fields)
+            energy = energy + 0.5 * scatter_sum(
+                src=self_node_energies, index=batch, dim=-1, dim_size=num_graphs
+            )
+
+        return energy
+
+
+class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
+    """Exact projected-potential features of Gaussian multipole densities (l <= 1).
+
+    Closed-form replacement for RealSpaceFiniteDifferenceElectrostaticFeatures:
+    the l=0 feature per radial channel is the source potential smeared with the
+    combined width sqrt(density_width^2 + projection_width^2), and the l=1
+    feature is its exact gradient with respect to the receiver position, so the
+    features are exactly rotationally equivariant.
+
+    Conventions match RealSpaceAnalyticalEnergy; the output layout matches the
+    finite-difference module: [n_nodes, num_radial] scalar features followed
+    (for projection_max_l >= 1) by num_radial blocks of e3nn-ordered (y, z, x)
+    vector features, [n_nodes, 4 * num_radial] in total.
+    """
+
+    def __init__(
+        self,
+        density_max_l: int,
+        density_smearing_width: float,
+        projection_max_l: int,
+        projection_smearing_widths: list[float],
+        include_self_interaction: bool = False,
+        integral_normalization: str = "receiver",
+    ):
+        super().__init__()
+        if density_max_l not in (0, 1) or projection_max_l not in (0, 1):
+            raise ValueError(
+                "RealSpaceAnalyticalElectrostaticFeatures only supports l=0 and l=1."
+            )
+        if density_smearing_width <= 0.0:
+            raise ValueError("density_smearing_width must be positive.")
+        if len(projection_smearing_widths) == 0:
+            raise ValueError("projection_smearing_widths must not be empty.")
+        if any(width <= 0.0 for width in projection_smearing_widths):
+            raise ValueError("projection_smearing_widths must be positive.")
+        if integral_normalization not in ("multipoles", "receiver", "none"):
+            raise ValueError(
+                "integral_normalization must be one of 'multipoles', 'receiver', 'none'"
+            )
+
+        self.density_max_l = density_max_l
+        self.projection_max_l = projection_max_l
+        self.include_self_interaction = include_self_interaction
+        self.density_smearing_width = density_smearing_width
+        self.projection_smearing_widths = projection_smearing_widths
+        self.num_radial = len(projection_smearing_widths)
+
+        self.self_interaction = GTOSelfInteractionBlock(
+            density_max_l,
+            density_smearing_width,
+            projection_max_l,
+            projection_smearing_widths,
+            "multipoles",
+            integral_normalization,
+        )
+
+        combined_smearing_widths = torch.tensor(
+            [
+                math.sqrt(density_smearing_width**2 + projection_width**2)
+                for projection_width in projection_smearing_widths
+            ],
+            dtype=torch.get_default_dtype(),
+        )
+        self.register_buffer("combined_smearing_widths", combined_smearing_widths)
+
+        # The moment-normalized formulas give the smeared potential and its
+        # gradient; these per-channel factors convert to the requested receiver
+        # normalization (see get_Cl_sigma). Unlike the finite-difference module,
+        # no offset-dependent factors appear.
+        l0_factors = [
+            get_Cl_sigma(0, projection_width, normalize=integral_normalization)
+            / get_Cl_sigma(0, projection_width, normalize="multipoles")
+            for projection_width in projection_smearing_widths
+        ]
+        self.register_buffer(
+            "l0_factors", torch.tensor(l0_factors, dtype=torch.get_default_dtype())
+        )
+        if projection_max_l >= 1:
+            l1_factors = [
+                get_Cl_sigma(1, projection_width, normalize=integral_normalization)
+                / get_Cl_sigma(1, projection_width, normalize="multipoles")
+                for projection_width in projection_smearing_widths
+            ]
+            self.register_buffer(
+                "l1_factors",
+                torch.tensor(l1_factors, dtype=torch.get_default_dtype()),
+            )
+
+    def forward(
+        self,
+        source_feats: torch.Tensor,  # [n_nodes, (density_max_l+1)**2]
+        node_positions: torch.Tensor,  # [n_nodes, 3]
+        batch: torch.Tensor,  # [n_nodes]
+    ):
+        _validate_source_features(source_feats, self.density_max_l)
+        num_nodes = node_positions.shape[0]
+
+        edge_index = batch_complete_graph_excluding_self_duplicates_vector(batch, 1)
+        sender, receiver = edge_index[0], edge_index[1]
+
+        # separation points from the sending density to the receiving node.
+        separation = node_positions[receiver] - node_positions[sender]  # [n_edges, 3]
+        distance_squared = torch.sum(
+            separation * separation, dim=-1, keepdim=True
+        )  # [n_edges, 1]
+
+        if self.density_max_l >= 1 and self.projection_max_l >= 1:
+            highest_order = 2
+        elif self.density_max_l >= 1 or self.projection_max_l >= 1:
+            highest_order = 1
+        else:
+            highest_order = 0
+        kernels = smeared_coulomb_kernels(
+            distance_squared, self.combined_smearing_widths, highest_order
+        )  # each [n_edges, num_radial]
+
+        charges = source_feats[:, 0]
+        sender_charges = charges[sender].unsqueeze(-1)  # [n_edges, 1]
+
+        scalar_edge_features = sender_charges * kernels[0]
+        if self.density_max_l >= 1:
+            dipoles = source_feats[:, E3NN_TO_CARTESIAN_COLUMNS]  # (x, y, z)
+            sender_dipoles = dipoles[sender]  # [n_edges, 3]
+            sender_dipole_along_separation = torch.sum(
+                sender_dipoles * separation, dim=-1, keepdim=True
+            )  # [n_edges, 1]
+            scalar_edge_features = (
+                scalar_edge_features + sender_dipole_along_separation * kernels[1]
+            )
+
+        scalar_features = scatter_sum(
+            src=scalar_edge_features, index=receiver, dim=0, dim_size=num_nodes
+        )  # [n_nodes, num_radial]
+        scalar_features = (
+            FIELD_CONSTANT / (4 * pi) * self.l0_factors * scalar_features
+        )
+        feature_blocks = [scalar_features]
+
+        if self.projection_max_l >= 1:
+            # Gradient of the smeared potential with respect to the receiver
+            # position: [n_edges, num_radial, 3] in Cartesian components.
+            gradient_edge_features = (
+                -sender_charges.unsqueeze(-1)
+                * separation.unsqueeze(1)
+                * kernels[1].unsqueeze(-1)
+            )
+            if self.density_max_l >= 1:
+                gradient_edge_features = (
+                    gradient_edge_features
+                    + sender_dipoles.unsqueeze(1) * kernels[1].unsqueeze(-1)
+                    - sender_dipole_along_separation.unsqueeze(-1)
+                    * separation.unsqueeze(1)
+                    * kernels[2].unsqueeze(-1)
+                )
+
+            gradient_features = scatter_sum(
+                src=gradient_edge_features, index=receiver, dim=0, dim_size=num_nodes
+            )  # [n_nodes, num_radial, 3]
+            gradient_features = (
+                FIELD_CONSTANT
+                / (4 * pi)
+                * self.l1_factors.unsqueeze(-1)
+                * gradient_features
+            )
+            vector_features = gradient_features[..., CARTESIAN_TO_E3NN_COMPONENTS]
+            feature_blocks.append(vector_features.reshape(num_nodes, -1))
+
+        features = torch.cat(feature_blocks, dim=-1)
+
+        self_interaction_terms = self.self_interaction(source_feats)
+        if self.include_self_interaction:
+            features = features + self_interaction_terms
 
         return features, self_interaction_terms, None
