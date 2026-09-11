@@ -134,6 +134,12 @@ def batch_complete_graph_excluding_self_duplicates_vector(
     edges between every pair of duplicates *unless* they share the same
     original node ID.
 
+    Fully vectorized block-diagonal construction: duplicated nodes are
+    grouped by graph with a stable sort, every graph's complete pair mesh is
+    enumerated from cumulative node/edge offsets, and same-origin pairs are
+    filtered at the end. No per-graph Python loop; two host syncs
+    (allocation sizes) per call.
+
     Args:
         batch (LongTensor): shape [M], graph ID of each original node.
         N (int): number of duplicates per node.
@@ -142,36 +148,40 @@ def batch_complete_graph_excluding_self_duplicates_vector(
         edge_index (LongTensor[2, E])
     """
     batch = batch.long()
-    orig = torch.arange(batch.size(0), device=batch.device)
+    device = batch.device
+    num_nodes = batch.size(0)
+    if num_nodes == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
+
+    original_node_ids = torch.arange(num_nodes, device=device)
     # duplicated per-node graph ID and original-ID
-    batch2 = batch.repeat_interleave(N)  # [M*N]
-    orig2 = orig.repeat_interleave(N)  # [M*N]
+    duplicated_batch = batch.repeat_interleave(N)  # [M*N]
+    duplicated_original_ids = original_node_ids.repeat_interleave(N)  # [M*N]
 
-    G = int(batch2.max().item()) + 1
-    edges = []
+    # group duplicated nodes by graph (stable, so duplicates keep their order)
+    grouped_nodes = torch.argsort(duplicated_batch, stable=True)  # [M*N]
+    graph_sizes = torch.bincount(duplicated_batch)  # [n_graphs]
+    graph_edge_counts = graph_sizes * graph_sizes
 
-    for g in range(G):
-        # pick out all duplicates in graph g
-        mask = batch2 == g
-        nodes = mask.nonzero(as_tuple=False).view(-1)  # [D]
-        if nodes.numel() <= 1:
-            continue
+    node_offsets = torch.cumsum(graph_sizes, dim=0) - graph_sizes
+    edge_offsets = torch.cumsum(graph_edge_counts, dim=0) - graph_edge_counts
+    num_dense_edges = int(graph_edge_counts.sum().item())
 
-        # 1 big mesh of every pair in this graph
-        D = nodes.size(0)
-        row = nodes.view(-1, 1).expand(-1, D).reshape(-1)
-        col = nodes.view(1, -1).expand(D, -1).reshape(-1)
+    graph_of_edge = torch.repeat_interleave(
+        torch.arange(graph_sizes.size(0), device=device), graph_edge_counts
+    )  # [E_dense]
+    local_edge_ids = (
+        torch.arange(num_dense_edges, device=device) - edge_offsets[graph_of_edge]
+    )
+    graph_size_of_edge = graph_sizes[graph_of_edge]
+    local_senders = local_edge_ids // graph_size_of_edge
+    local_receivers = local_edge_ids % graph_size_of_edge
 
-        # mask out pairs where orig2 is the same
-        orig_row = orig2[mask].view(-1, 1).expand(-1, D).reshape(-1)
-        orig_col = orig2[mask].view(1, -1).expand(D, -1).reshape(-1)
-        keep = orig_row != orig_col
+    senders = grouped_nodes[node_offsets[graph_of_edge] + local_senders]
+    receivers = grouped_nodes[node_offsets[graph_of_edge] + local_receivers]
 
-        edges.append(torch.stack([row[keep], col[keep]], dim=0))
-
-    if not edges:
-        return torch.empty((2, 0), dtype=torch.long, device=batch.device)
-    return torch.cat(edges, dim=1)
+    keep = duplicated_original_ids[senders] != duplicated_original_ids[receivers]
+    return torch.stack([senders[keep], receivers[keep]], dim=0)
 
 
 def charges_energy_from_graph(
