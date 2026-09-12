@@ -91,7 +91,9 @@ def charges_energy_from_graph(
         return torch.zeros(
             (batch.max() + 1,), dtype=charges.dtype, device=charges.device
         )
-    node_energies = scatter_sum(src=edge_energy.squeeze(-1), index=receiver, dim=-1)
+    node_energies = scatter_sum(
+        src=edge_energy.squeeze(-1), index=receiver, dim=-1, dim_size=charges.shape[0]
+    )
     return scatter_sum(src=node_energies, index=batch, dim=-1)  # [n_graphs]
 
 
