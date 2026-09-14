@@ -102,6 +102,13 @@ def smeared_coulomb_kernels(
     """
     if highest_order < 0:
         raise ValueError("highest_order must be non-negative")
+    # Further work (performance): both branches are evaluated for every edge,
+    # and the unrolled series alone emits ~40 small elementwise kernels, so
+    # batches of many tiny graphs are launch-overhead bound (0.6-0.8x vs the
+    # finite-difference modules on B200; every larger regime wins). The whole
+    # chain is straight-line elementwise math and should fuse into a few
+    # kernels under torch.compile — untested; verify compilation and double
+    # backward before relying on it.
     scaled_distance_squared = distance_squared / (
         2.0 * combined_smearing_width**2
     )
@@ -578,6 +585,14 @@ class RealSpaceAnalyticalEnergy(torch.nn.Module):
     components in e3nn order (y, z, x); pair separations are
     positions[receiver] - positions[sender]; the directed edge sum carries the
     0.5 double-counting factor and the FIELD_CONSTANT / (4 pi) prefactor.
+
+    Further work (performance, applies to the features module as well): forces
+    come from autograd, which stores the per-edge intermediates (~2 GB
+    backward peak at 3000 atoms). The position gradients are themselves closed
+    form (one more kernel order, B_3), so a custom backward composed of
+    differentiable ops would cut memory and forward+forces time — it must
+    preserve double backward for force-loss training (rerun gradgradcheck and
+    the branch-straddling gradient tests).
     """
 
     def __init__(
