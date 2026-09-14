@@ -1,13 +1,13 @@
 import math
 
 import torch
+from mace.tools.scatter import scatter_sum
 from scipy.constants import pi
 
 from .gto_utils import (
     GTOSelfInteractionBlock,
     get_Cl_sigma,
 )
-from .scatter import scatter_sum
 from .utils import FIELD_CONSTANT
 
 # Sign convention used by the analytical modules (and by charges_energy_from_graph):
