@@ -135,10 +135,13 @@ def batch_complete_graph_excluding_self_duplicates_vector(
     original node ID.
 
     Fully vectorized block-diagonal construction: duplicated nodes are
-    grouped by graph with a stable sort, every graph's complete pair mesh is
-    enumerated from cumulative node/edge offsets, and same-origin pairs are
-    filtered at the end. No per-graph Python loop; two host syncs
-    (allocation sizes) per call.
+    grouped by graph with a stable sort. When every graph has the same size
+    (single graphs and uniform batches) the pair mesh is a plain batched
+    broadcast with no per-edge gathers; otherwise every sender's receiver
+    block is enumerated from cumulative per-node edge offsets. All
+    dense-edge-sized work is additions and gathers (no integer
+    division/modulo, which is emulated and slow for int64 on GPUs). No
+    per-graph Python loop; two host syncs per call.
 
     Args:
         batch (LongTensor): shape [M], graph ID of each original node.
@@ -161,24 +164,35 @@ def batch_complete_graph_excluding_self_duplicates_vector(
     # group duplicated nodes by graph (stable, so duplicates keep their order)
     grouped_nodes = torch.argsort(duplicated_batch, stable=True)  # [M*N]
     graph_sizes = torch.bincount(duplicated_batch)  # [n_graphs]
-    graph_edge_counts = graph_sizes * graph_sizes
 
-    node_offsets = torch.cumsum(graph_sizes, dim=0) - graph_sizes
-    edge_offsets = torch.cumsum(graph_edge_counts, dim=0) - graph_edge_counts
-    num_dense_edges = int(graph_edge_counts.sum().item())
+    if bool((graph_sizes == graph_sizes[0]).all().item()):
+        # equal-size fast path: batched dense mesh via broadcasting
+        num_graphs = graph_sizes.size(0)
+        size = grouped_nodes.numel() // num_graphs
+        nodes = grouped_nodes.view(num_graphs, size)
+        senders = nodes.unsqueeze(2).expand(num_graphs, size, size).reshape(-1)
+        receivers = nodes.unsqueeze(1).expand(num_graphs, size, size).reshape(-1)
+    else:
+        node_offsets = torch.cumsum(graph_sizes, dim=0) - graph_sizes  # [n_graphs]
 
-    graph_of_edge = torch.repeat_interleave(
-        torch.arange(graph_sizes.size(0), device=device), graph_edge_counts
-    )  # [E_dense]
-    local_edge_ids = (
-        torch.arange(num_dense_edges, device=device) - edge_offsets[graph_of_edge]
-    )
-    graph_size_of_edge = graph_sizes[graph_of_edge]
-    local_senders = local_edge_ids // graph_size_of_edge
-    local_receivers = local_edge_ids % graph_size_of_edge
+        # per grouped node: its graph's size (= its number of outgoing dense
+        # edges) and its graph's first slot in the grouped ordering
+        edges_per_node = graph_sizes.repeat_interleave(graph_sizes)  # [M*N]
+        graph_start_of_node = node_offsets.repeat_interleave(graph_sizes)  # [M*N]
+        edge_start_of_node = torch.cumsum(edges_per_node, dim=0) - edges_per_node
 
-    senders = grouped_nodes[node_offsets[graph_of_edge] + local_senders]
-    receivers = grouped_nodes[node_offsets[graph_of_edge] + local_receivers]
+        num_dense_edges = int(edges_per_node.sum().item())
+        sender_slots = torch.repeat_interleave(
+            torch.arange(edges_per_node.size(0), device=device), edges_per_node
+        )  # [E_dense]
+        receiver_slots = (
+            torch.arange(num_dense_edges, device=device)
+            - edge_start_of_node[sender_slots]
+            + graph_start_of_node[sender_slots]
+        )
+
+        senders = grouped_nodes[sender_slots]
+        receivers = grouped_nodes[receiver_slots]
 
     keep = duplicated_original_ids[senders] != duplicated_original_ids[receivers]
     return torch.stack([senders[keep], receivers[keep]], dim=0)
