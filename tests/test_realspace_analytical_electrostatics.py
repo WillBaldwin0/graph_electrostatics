@@ -22,7 +22,9 @@ import sympy
 import torch
 from scipy.constants import pi
 
+from graph_longrange.gto_utils import get_Cl_sigma
 from graph_longrange.realspace_electrostatics import (
+    SERIES_CROSSOVER,
     RealSpaceAnalyticalElectrostaticFeatures,
     RealSpaceAnalyticalEnergy,
     RealSpaceFiniteDifferenceElectrostaticFeatures,
@@ -166,6 +168,175 @@ def test_kernels_far_field_point_multipole_limit():
     assert kernels[2][0].item() == pytest.approx(3.0 / distance**5, rel=1e-10)
 
 
+def test_kernel_dispatcher_autograd_derivatives_across_crossover():
+    """Autograd derivatives of the *dispatched* kernels (the where/clamp
+    construction), including exactly at and adjacent to the branch crossover.
+
+    With s = R^2 the derivative chain B_{n+1}(R) = -(1/R) dB_n/dR becomes
+    dB_n/ds = -B_{n+1}/2 and d^2 B_0/ds^2 = B_2/4, so the dispatcher's
+    autograd derivatives can be checked against its own kernel values (which
+    test_kernels_match_symbolic_derivatives pins against sympy).
+    """
+    combined_width = DENSITY_SMEARING_WIDTH
+    scaled_values = torch.tensor(
+        [
+            0.0,
+            1e-12,
+            1e-6,
+            0.1,
+            0.25,
+            SERIES_CROSSOVER - 1e-9,
+            SERIES_CROSSOVER,
+            SERIES_CROSSOVER + 1e-9,
+            0.6,
+            1.0,
+            10.0,
+            100.0,
+        ],
+        dtype=torch.float64,
+    )
+    distance_squared = (2.0 * combined_width**2 * scaled_values).requires_grad_(True)
+    kernels = smeared_coulomb_kernels(distance_squared, combined_width, 3)
+
+    for order in range(3):
+        first_derivative = torch.autograd.grad(
+            kernels[order].sum(),
+            distance_squared,
+            create_graph=(order == 0),
+            retain_graph=True,
+        )[0]
+        assert torch.isfinite(first_derivative).all()
+        torch.testing.assert_close(
+            first_derivative,
+            -0.5 * kernels[order + 1].detach(),
+            rtol=1e-11,
+            atol=0.0,
+        )
+        if order == 0:
+            second_derivative = torch.autograd.grad(
+                first_derivative.sum(), distance_squared, retain_graph=True
+            )[0]
+            assert torch.isfinite(second_derivative).all()
+            torch.testing.assert_close(
+                second_derivative,
+                0.25 * kernels[2].detach(),
+                rtol=1e-10,
+                atol=0.0,
+            )
+
+
+def test_energy_and_forces_smooth_through_branch_crossover():
+    """Two atoms swept through the branch-crossover distance: autograd forces
+    must match central finite differences of the energy at every sample, so any
+    dispatch discontinuity in value or derivative would show up as a spike."""
+    module = RealSpaceAnalyticalEnergy(1, DENSITY_SMEARING_WIDTH)
+    combined_width = math.sqrt(2.0) * DENSITY_SMEARING_WIDTH
+    crossover_distance = combined_width * math.sqrt(2.0 * SERIES_CROSSOVER)
+    source_feats = torch.tensor(
+        [[0.7, 0.2, -0.4, 0.3], [-0.5, -0.1, 0.25, 0.15]], dtype=torch.float64
+    )
+    batch = torch.zeros(2, dtype=torch.long)
+    direction = torch.tensor([1.0, 2.0, -0.5], dtype=torch.float64)
+    direction = direction / direction.norm()
+
+    def energy_at(distance):
+        positions = torch.stack([torch.zeros(3, dtype=torch.float64), distance * direction])
+        return module(source_feats, positions, batch)[0]
+
+    step = 1e-6
+    for distance in torch.linspace(
+        0.95 * crossover_distance, 1.05 * crossover_distance, 21, dtype=torch.float64
+    ):
+        distance_input = distance.clone().requires_grad_(True)
+        energy = energy_at(distance_input)
+        (energy_derivative,) = torch.autograd.grad(energy, distance_input)
+        finite_difference = (
+            energy_at(distance + step) - energy_at(distance - step)
+        ) / (2 * step)
+        assert energy_derivative.item() == pytest.approx(
+            finite_difference.item(), rel=1e-7
+        )
+
+
+def _system_straddling_branches():
+    """Four collinear atoms whose pair distances put edges in the series branch,
+    the closed-form branch, and exactly at the crossover (for the energy width),
+    with the two feature channels (widths 1.0 and 2.0) disagreeing about the
+    branch on one edge."""
+    combined_energy_width = math.sqrt(2.0) * DENSITY_SMEARING_WIDTH
+    crossover_distance = combined_energy_width * math.sqrt(2.0 * SERIES_CROSSOVER)
+    direction = torch.tensor([2.0, -1.0, 0.5], dtype=torch.float64)
+    direction = direction / direction.norm()
+    distances_from_first = torch.tensor(
+        [0.0, 1.2, 3.2, crossover_distance], dtype=torch.float64
+    )
+    positions = distances_from_first.unsqueeze(-1) * direction
+    generator = torch.Generator().manual_seed(20)
+    source_feats = 0.5 * torch.randn((4, 4), generator=generator, dtype=torch.float64)
+    batch = torch.zeros(4, dtype=torch.long)
+    return source_feats, positions, batch
+
+
+def test_branch_membership_of_straddling_system():
+    """Guard: the engineered system really exercises both branches (and, for the
+    feature widths, an edge whose branch differs per radial channel)."""
+    _, positions, _ = _system_straddling_branches()
+    pair_distances_squared = (
+        (positions.unsqueeze(0) - positions.unsqueeze(1)) ** 2
+    ).sum(-1)[torch.triu_indices(4, 4, offset=1).unbind()]
+
+    energy_scaled = pair_distances_squared / (
+        2.0 * (math.sqrt(2.0) * DENSITY_SMEARING_WIDTH) ** 2
+    )
+    assert (energy_scaled < SERIES_CROSSOVER).any()
+    assert (energy_scaled >= SERIES_CROSSOVER).any()
+    assert torch.isclose(
+        energy_scaled, torch.tensor(SERIES_CROSSOVER, dtype=torch.float64)
+    ).any()
+
+    feature_scaled = [
+        pair_distances_squared
+        / (2.0 * (DENSITY_SMEARING_WIDTH**2 + projection_width**2))
+        for projection_width in PROJECTION_SMEARING_WIDTHS
+    ]
+    per_channel_masks = torch.stack(
+        [scaled < SERIES_CROSSOVER for scaled in feature_scaled]
+    )
+    assert (per_channel_masks[0] != per_channel_masks[1]).any()
+
+
+def test_energy_gradients_with_edges_in_both_branches():
+    source_feats, positions, batch = _system_straddling_branches()
+    module = RealSpaceAnalyticalEnergy(1, DENSITY_SMEARING_WIDTH)
+    positions_input = positions.clone().requires_grad_(True)
+    assert torch.autograd.gradcheck(
+        lambda pos: module(source_feats, pos, batch).sum(),
+        (positions_input,),
+        eps=1e-6,
+        atol=1e-8,
+    )
+    assert torch.autograd.gradgradcheck(
+        lambda pos: module(source_feats, pos, batch).sum(),
+        (positions_input,),
+        eps=1e-6,
+        atol=1e-7,
+    )
+
+
+def test_features_gradcheck_with_edges_in_both_branches():
+    source_feats, positions, batch = _system_straddling_branches()
+    module = RealSpaceAnalyticalElectrostaticFeatures(
+        1, DENSITY_SMEARING_WIDTH, 1, PROJECTION_SMEARING_WIDTHS
+    )
+    positions_input = positions.clone().requires_grad_(True)
+    assert torch.autograd.gradcheck(
+        lambda pos: module(source_feats, pos, batch)[0].pow(2).sum(),
+        (positions_input,),
+        eps=1e-6,
+        atol=1e-8,
+    )
+
+
 def test_kernels_float32_accuracy():
     combined_width = DENSITY_SMEARING_WIDTH
     scaled = np.logspace(-6, 2, 25)
@@ -307,6 +478,157 @@ def test_pair_energy_matches_gauss_hermite_quadrature():
 # ---------------------------------------------------------------------------
 # 3. Consistency with the existing modules
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("integral_normalization", ["receiver", "multipoles"])
+def test_feature_module_matches_projection_quadrature_oracle(integral_normalization):
+    """Module-level first-principles oracle for the projected-potential features.
+
+    The feature of receiver basis function phi_{lm,n} is
+    FIELD_CONSTANT / (4 pi) * integral phi_{lm,n}(r - R_receiver) V_source(r) d^3 r,
+    with phi built here directly from get_Cl_sigma for the requested
+    normalization, and V_source the closed-form potential of the
+    moment-normalized source (itself validated against radial quadrature in
+    test_potential_matches_radial_shell_quadrature). The integral is evaluated
+    with tensor-product Gauss-Hermite quadrature centered on the receiver.
+    Independent of the finite-difference module, this pins the mixed-width
+    kernels, the l0/l1 normalization factors, the sign convention, and the
+    e3nn component ordering in one shot.
+    """
+    density_width = DENSITY_SMEARING_WIDTH
+    source_charge = 0.7
+    source_dipole = np.array([0.3, -0.45, 0.2])  # Cartesian (x, y, z)
+    separation_direction = np.array([1.0, -2.0, 1.5])
+    separation_direction /= np.linalg.norm(separation_direction)
+
+    nodes, weights = np.polynomial.hermite.hermgauss(40)
+    grid = np.stack(np.meshgrid(nodes, nodes, nodes, indexing="ij"), axis=-1)
+    grid = grid.reshape(-1, 3)
+    grid_weights = (
+        weights[:, None, None] * weights[None, :, None] * weights[None, None, :]
+    ).reshape(-1)
+
+    def source_potential(points, source_position):
+        displacement = points - source_position
+        distance = np.linalg.norm(displacement, axis=-1)
+        kernel_0 = scipy.special.erf(
+            distance / (math.sqrt(2) * density_width)
+        ) / distance
+        gaussian_term = (
+            math.sqrt(2 / pi)
+            / density_width
+            * np.exp(-(distance**2) / (2 * density_width**2))
+        )
+        kernel_1 = (kernel_0 - gaussian_term) / distance**2
+        return source_charge * kernel_0 + (displacement @ source_dipole) * kernel_1
+
+    module = RealSpaceAnalyticalElectrostaticFeatures(
+        1,
+        density_width,
+        1,
+        PROJECTION_SMEARING_WIDTHS,
+        integral_normalization=integral_normalization,
+    )
+
+    for separation_distance in [0.8, 2.2, 5.0]:
+        source_position = np.zeros(3)
+        receiver_position = separation_distance * separation_direction
+
+        source_feats = torch.zeros((2, 4), dtype=torch.float64)
+        source_feats[0, 0] = source_charge
+        source_feats[0, E3NN_TO_CARTESIAN_COLUMNS] = torch.from_numpy(source_dipole)
+        positions = torch.stack(
+            [
+                torch.zeros(3, dtype=torch.float64),
+                torch.from_numpy(receiver_position),
+            ]
+        )
+        batch = torch.zeros(2, dtype=torch.long)
+        features = module(source_feats, positions, batch)[0][1]  # receiver node
+
+        for channel, projection_width in enumerate(PROJECTION_SMEARING_WIDTHS):
+            # r = receiver_position + sqrt(2) * projection_width * t
+            points = receiver_position + math.sqrt(2) * projection_width * grid
+            local = points - receiver_position
+            potential_values = source_potential(points, source_position)
+            jacobian = (math.sqrt(2) * projection_width) ** 3
+
+            normalization_l0 = get_Cl_sigma(
+                0, projection_width, normalize=integral_normalization
+            )
+            oracle_scalar = (
+                FIELD_CONSTANT
+                / (4 * pi)
+                * jacobian
+                * normalization_l0
+                / math.sqrt(4 * pi)
+                * np.sum(grid_weights * potential_values)
+            )
+            assert features[channel].item() == pytest.approx(oracle_scalar, rel=1e-9)
+
+            normalization_l1 = get_Cl_sigma(
+                1, projection_width, normalize=integral_normalization
+            )
+            # the vector block is e3nn-ordered (y, z, x): column offset k holds
+            # Cartesian axis CARTESIAN_TO_E3NN_COMPONENTS[k]
+            for e3nn_offset, cartesian_axis in enumerate(
+                CARTESIAN_TO_E3NN_COMPONENTS
+            ):
+                oracle_vector = (
+                    FIELD_CONSTANT
+                    / (4 * pi)
+                    * jacobian
+                    * normalization_l1
+                    * math.sqrt(3 / (4 * pi))
+                    * np.sum(
+                        grid_weights * local[:, cartesian_axis] * potential_values
+                    )
+                )
+                column = len(PROJECTION_SMEARING_WIDTHS) + 3 * channel + e3nn_offset
+                assert features[column].item() == pytest.approx(
+                    oracle_vector, rel=1e-9, abs=1e-13
+                )
+
+
+def test_feature_self_interaction_terms_match_zero_distance_limit():
+    """The feature module's self-interaction terms (numerically integrated in
+    GTOSelfInteractionBlock) must equal the R -> 0 limit of the analytical pair
+    features: FIELD_CONSTANT / (4 pi) * l_factor_n * moment * B_l(0; Sigma_n)."""
+    generator = torch.Generator().manual_seed(21)
+    source_feats = 0.5 * torch.randn((3, 4), generator=generator, dtype=torch.float64)
+    module = RealSpaceAnalyticalElectrostaticFeatures(
+        1, DENSITY_SMEARING_WIDTH, 1, PROJECTION_SMEARING_WIDTHS
+    )
+    positions = 2.0 * torch.randn((3, 3), generator=generator, dtype=torch.float64)
+    batch = torch.zeros(3, dtype=torch.long)
+    self_terms = module(source_feats, positions, batch)[1]
+
+    num_radial = len(PROJECTION_SMEARING_WIDTHS)
+    for channel, projection_width in enumerate(PROJECTION_SMEARING_WIDTHS):
+        combined_width = math.sqrt(DENSITY_SMEARING_WIDTH**2 + projection_width**2)
+        kernel_0_at_zero = math.sqrt(2 / pi) / combined_width
+        kernel_1_at_zero = math.sqrt(2 / pi) / (3 * combined_width**3)
+        l0_factor = get_Cl_sigma(0, projection_width, normalize="receiver") / (
+            get_Cl_sigma(0, projection_width, normalize="multipoles")
+        )
+        l1_factor = get_Cl_sigma(1, projection_width, normalize="receiver") / (
+            get_Cl_sigma(1, projection_width, normalize="multipoles")
+        )
+        expected_scalar = (
+            FIELD_CONSTANT / (4 * pi) * l0_factor * source_feats[:, 0] * kernel_0_at_zero
+        )
+        torch.testing.assert_close(
+            self_terms[:, channel], expected_scalar, rtol=1e-6, atol=1e-12
+        )
+        expected_vector = (
+            FIELD_CONSTANT / (4 * pi) * l1_factor * source_feats[:, 1:] * kernel_1_at_zero
+        )
+        torch.testing.assert_close(
+            self_terms[:, num_radial + 3 * channel : num_radial + 3 * channel + 3],
+            expected_vector,
+            rtol=1e-6,
+            atol=1e-12,
+        )
 
 
 def test_l0_energy_matches_finite_difference_module():
