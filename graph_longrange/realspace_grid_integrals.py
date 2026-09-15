@@ -5,31 +5,6 @@ from .utils import permute_to_e3nn_convention
 import scipy.special
 
 
-def old_tensor_get_grid_cell(Delta, cell):
-    # use delta as the spacing for all the directions
-    # cell is [3,3], first index is the lattice vector
-    
-    vector_norms = torch.sqrt(torch.sum(torch.square(cell), axis=1))
-    normed_vectors = torch.divide(cell, vector_norms)
-    g_spacing = normed_vectors * Delta
-    data_shape = torch.round(torch.divide(vector_norms, torch.sqrt(torch.sum(torch.square(g_spacing), axis=1))))
-    
-    origin = torch.zeros((3))
-
-    # messy bit
-    numpy_data_shape = data_shape.cpu().detach().numpy()
-    coeficients = []
-    for i in range(3):
-        coeficients.append(np.arange(0, numpy_data_shape[i], 1, dtype=float))
-
-    coefs = torch.from_numpy(np.asarray(np.meshgrid(coeficients[0], coeficients[1], coeficients[2], indexing='ij')))
-    coordinates = torch.einsum('iabc,ij->abcj', coefs, g_spacing)
-    coordinates = coordinates + origin
-
-    # [a,b,c,j], with j being the direction index
-    return coordinates
-
-
 def tensor_get_grid_cell(Delta, cell):
     # use delta as the approximate spacing in all directions
     # cell is [3,3], first index is the lattice vector
