@@ -315,7 +315,7 @@ class CorrectivePotentialBlock(torch.nn.Module):
 
 
 class MonopoleDipoleCorrectionBlock(torch.nn.Module):
-    """
+    r"""
     Implements corrections for evaluating clusters large boxes. See
     - https://journals.aps.org/prb/pdf/10.1103/PhysRevB.51.4014 (Makov and Payne)
     - https://journals.aps.org/prb/pdf/10.1103/PhysRevB.77.115139 (Dabo et al)
