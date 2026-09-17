@@ -193,7 +193,7 @@ class CorrectivePotentialBlock(torch.nn.Module):
         node_fields = positions.new_zeros((positions.shape[0], 4))
 
         # L=0 piece has several terms
-        Ls = torch.pow(volumes, 0.333333)
+        Ls = torch.pow(volumes.abs(), 1.0 / 3.0)
         delta_V_0 = CUBIC_MADELUNG * self.const * total_charge / Ls
         node_delta_V = torch.index_select(delta_V_0, 0, batch)
         node_delta_V += (
@@ -282,7 +282,7 @@ class CorrectivePotentialBlock(torch.nn.Module):
             device=tgt_positions.device,
         )
 
-        Ls = torch.pow(volumes, 0.333333)
+        Ls = torch.pow(volumes.abs(), 1.0 / 3.0)
         delta_V_0 = CUBIC_MADELUNG * self.const * total_charge / Ls
         node_delta_V = torch.index_select(delta_V_0, 0, tgt_batch)
         node_delta_V += (
@@ -371,7 +371,7 @@ class MonopoleDipoleCorrectionBlock(torch.nn.Module):
             quadrupole += 2 * scatter_sum(src=p_dot_r, index=batch, dim=0, dim_size=n_graphs)
 
         # charge correction
-        Ls = torch.pow(volumes, 0.3333)
+        Ls = torch.pow(volumes.abs(), 1.0 / 3.0)
         delta_E = 0.5 * CUBIC_MADELUNG * self.const * charge_norms_squared / Ls
 
         # dipole correction
