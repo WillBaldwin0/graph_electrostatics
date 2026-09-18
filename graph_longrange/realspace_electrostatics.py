@@ -1,4 +1,5 @@
 import math
+from typing import Literal
 
 import torch
 from mace.tools.scatter import scatter_sum
@@ -19,6 +20,11 @@ from .utils import FIELD_CONSTANT
 # CARTESIAN_TO_E3NN_COMPONENTS yields e3nn order (y, z, x).
 E3NN_TO_CARTESIAN_COLUMNS = [3, 1, 2]
 CARTESIAN_TO_E3NN_COMPONENTS = [1, 2, 0]
+
+# Which real-space evaluator the GTO blocks in energy.py / features.py build.
+# "finite_difference" is the default everywhere so that existing checkpoints keep
+# reproducing the numbers their weights were fitted to.
+RealSpaceMethod = Literal["finite_difference", "analytical"]
 
 SQRT_TWO_OVER_PI = math.sqrt(2.0 / pi)
 
@@ -564,6 +570,24 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         return features, self_interaction_terms, None
 
 
+def _match_tensor_placement(
+    module: torch.nn.Module, reference: torch.nn.Module
+) -> torch.nn.Module:
+    """Put a freshly built real-space module where the one it replaces lives.
+
+    Only floating-point buffers follow the reference dtype (torch.nn.Module.to
+    leaves integer buffers such as the self-interaction select_indices alone), so
+    a model moved to a device or cast after construction keeps working when its
+    evaluator is swapped.
+    """
+    reference_tensor = next(
+        (buffer for buffer in reference.buffers() if buffer.is_floating_point()), None
+    )
+    if reference_tensor is None:
+        return module
+    return module.to(device=reference_tensor.device, dtype=reference_tensor.dtype)
+
+
 def _validate_source_features(source_feats: torch.Tensor, density_max_l: int) -> None:
     expected_columns = (density_max_l + 1) ** 2
     if source_feats.dim() != 2 or source_feats.shape[-1] != expected_columns:
@@ -703,6 +727,12 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
     finite-difference module: [n_nodes, num_radial] scalar features followed
     (for projection_max_l >= 1) by num_radial blocks of e3nn-ordered (y, z, x)
     vector features, [n_nodes, 4 * num_radial] in total.
+
+    The per-channel constants are registered as non-persistent buffers: they are
+    pure functions of the constructor arguments, and the finite-difference module
+    registers l0_factors / l1_factors of the same shape holding offset-dependent
+    values, so keeping them out of the state dict stops a non-strict load from
+    silently mixing the two conventions.
     """
 
     def __init__(
@@ -753,7 +783,9 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
             ],
             dtype=torch.get_default_dtype(),
         )
-        self.register_buffer("combined_smearing_widths", combined_smearing_widths)
+        self.register_buffer(
+            "combined_smearing_widths", combined_smearing_widths, persistent=False
+        )
 
         # The moment-normalized formulas give the smeared potential and its
         # gradient; these per-channel factors convert to the requested receiver
@@ -765,7 +797,9 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
             for projection_width in projection_smearing_widths
         ]
         self.register_buffer(
-            "l0_factors", torch.tensor(l0_factors, dtype=torch.get_default_dtype())
+            "l0_factors",
+            torch.tensor(l0_factors, dtype=torch.get_default_dtype()),
+            persistent=False,
         )
         if projection_max_l >= 1:
             l1_factors = [
@@ -776,6 +810,7 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
             self.register_buffer(
                 "l1_factors",
                 torch.tensor(l1_factors, dtype=torch.get_default_dtype()),
+                persistent=False,
             )
 
     def forward(
