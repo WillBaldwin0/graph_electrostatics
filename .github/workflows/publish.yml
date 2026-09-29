@@ -1,0 +1,65 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing Git tag to publish (e.g. v0.4.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Push: build the triggering commit. Manual: build the supplied tag.
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
+      - uses: astral-sh/setup-uv@v5
+      - name: Build distributions
+        run: uv build
+
+      - name: Check release tag matches package version
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from email.parser import BytesParser
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          tag = os.environ["RELEASE_TAG"]
+          if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
+              raise SystemExit(f"Invalid release tag: {tag!r}; expected vX.Y.Z")
+
+          wheel, = Path("dist").glob("*.whl")
+          with ZipFile(wheel) as archive:
+              metadata_file, = [
+                  name for name in archive.namelist()
+                  if name.endswith(".dist-info/METADATA")
+              ]
+              metadata = BytesParser().parsebytes(archive.read(metadata_file))
+
+          version = metadata["Version"]
+          if tag != f"v{version}":
+              raise SystemExit(
+                  f"Tag {tag!r} does not match package version {version!r}"
+              )
+          print(f"Validated release {tag}")
+          PY
+
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always
