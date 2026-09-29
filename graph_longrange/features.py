@@ -11,7 +11,12 @@ import torch
 from scipy.constants import pi
 
 from .gto_utils import GTOBasis, GTOSelfInteractionBlock, GTOInternalFieldtoFeaturesBlock
-from .realspace_electrostatics import RealSpaceFiniteDifferenceElectrostaticFeatures
+from .realspace_electrostatics import (
+    RealSpaceAnalyticalElectrostaticFeatures,
+    RealSpaceFiniteDifferenceElectrostaticFeatures,
+    RealSpaceMethod,
+    _match_tensor_placement,
+)
 from .slabs import (
     CorrectivePotentialBlock,
     slab_dipole_correction_node_fields,
@@ -289,6 +294,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         quadrupole_feature_corrections: bool = False,
         integral_normalization: str = "receiver",
         pbc_handling: FeaturePBCHandling = "mixed_periodic",
+        realspace_method: RealSpaceMethod = "finite_difference",
     ):
         super().__init__()
         self.density_basis = GTOBasis(
@@ -306,6 +312,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         self.kspace_cutoff = kspace_cutoff
         self.include_self_interaction = include_self_interaction
         self.pbc_handling = pbc_handling
+        self.realspace_method = realspace_method
 
         self.self_interaction_terms = GTOSelfInteractionBlock(
             l_source=density_max_l,
@@ -315,14 +322,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             normalize_source="multipoles",
             normalize_receive=integral_normalization,
         )
-        self.realspace_features = RealSpaceFiniteDifferenceElectrostaticFeatures(
-            density_max_l=density_max_l,
-            density_smearing_width=density_smearing_width,
-            projection_max_l=feature_max_l,
-            projection_smearing_widths=feature_smearing_widths,
-            include_self_interaction=include_self_interaction,
-            integral_normalization=integral_normalization,
-        )
+        self.realspace_features = self._build_realspace_features()
         self.non_periodic_correction_terms = NonPeriodicFeatureCorrections(
             density_max_l=density_max_l,
             projection_max_l=feature_max_l,
@@ -341,6 +341,29 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         self.static_quantities = None
         self._precompute_geometry_impl = self._select_precompute_geometry_impl()
         self._forward_dynamic_impl = self._select_forward_dynamic_impl()
+
+    def _build_realspace_features(self) -> torch.nn.Module:
+        """Build the non-periodic evaluator selected by self.realspace_method.
+
+        The constructor arguments are read back off the GTO bases rather than
+        stored again, so this also works on whole-model pickles written before
+        the flag existed: those restore their __dict__ without calling __init__.
+        """
+        method = getattr(self, "realspace_method", "finite_difference")
+        if method == "finite_difference":
+            module_class = RealSpaceFiniteDifferenceElectrostaticFeatures
+        elif method == "analytical":
+            module_class = RealSpaceAnalyticalElectrostaticFeatures
+        else:
+            raise ValueError(f"Unsupported realspace_method: {method}")
+        return module_class(
+            density_max_l=self.density_basis.max_l,
+            density_smearing_width=self.density_basis.sigmas[0],
+            projection_max_l=self.feature_basis.max_l,
+            projection_smearing_widths=self.feature_basis.sigmas,
+            include_self_interaction=self.include_self_interaction,
+            integral_normalization=self.feature_basis.normalize,
+        )
 
     @staticmethod
     def _build_output_permutation(max_l: int, n_radial: int) -> torch.Tensor:
@@ -389,6 +412,18 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         self.pbc_handling = pbc_handling
         self._precompute_geometry_impl = self._select_precompute_geometry_impl()
         self._forward_dynamic_impl = self._select_forward_dynamic_impl()
+
+    def set_realspace_method(self, realspace_method: RealSpaceMethod) -> None:
+        """Swap the non-periodic evaluator on an already-built block.
+
+        The analytical evaluator is exactly rotationally equivariant; the
+        finite-difference one is what existing weights were fitted against, so it
+        stays the default and this setter is the opt-in for an existing model.
+        """
+        self.realspace_method = realspace_method
+        self.realspace_features = _match_tensor_placement(
+            self._build_realspace_features(), self.realspace_features
+        )
 
     def forward(
         self,
