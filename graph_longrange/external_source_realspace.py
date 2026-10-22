@@ -3,6 +3,7 @@
 import torch
 from scipy.constants import pi
 from mace.tools.scatter import scatter_sum
+from .realspace_electrostatics import RealSpaceFiniteDifferenceElectrostaticFeatures
 from .utils import FIELD_CONSTANT
 
 @torch.no_grad()
@@ -80,6 +81,14 @@ class _ExternalSourceRealspace:
     """Reuse a real-space block's basis without rebuilding it."""
 
     def __init__(self, base):
+        if not isinstance(base, RealSpaceFiniteDifferenceElectrostaticFeatures):
+            raise NotImplementedError(
+                "The real-space source-target features re-implement the "
+                "finite-difference displaced-charge scheme and require "
+                f"realspace_method='finite_difference'; got {type(base).__name__}. "
+                "Use a periodic pbc_handling or keep the base block on finite "
+                "differences."
+            )
         self.base = base
 
     def __getattr__(self, name):

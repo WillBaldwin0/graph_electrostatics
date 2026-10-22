@@ -15,6 +15,7 @@ import torch
 from mace.tools.scatter import scatter_sum
 
 from .energy import GTOElectrostaticEnergy, energy_product_batch
+from .realspace_electrostatics import RealSpaceFiniteDiffereneEnergy
 from .features import (
     apply_coulomb_kernel_batch,
     assemble_fourier_series_batch,
@@ -205,6 +206,14 @@ class GTOElectrostaticCrossEnergy(torch.nn.Module):
         target_batch: torch.Tensor,
         num_graphs: int,
     ) -> torch.Tensor:
+        realspace = self.reference_energy.realspace_energy
+        if not isinstance(realspace, RealSpaceFiniteDiffereneEnergy):
+            raise NotImplementedError(
+                "The real-space cross energy re-implements the finite-difference "
+                "displaced-charge scheme and requires realspace_method="
+                f"'finite_difference'; got {type(realspace).__name__}. Use a "
+                "periodic pbc_handling or keep the base block on finite differences."
+            )
         source_q, source_pos, source_graph = self._as_displaced_charges(
             source_feats, source_positions, source_batch
         )

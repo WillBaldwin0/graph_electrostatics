@@ -15,7 +15,12 @@ from .features import (
     compute_coulomb_factor,
 )
 from .gto_utils import GTOBasis, GTOSelfInteractionBlock
-from .realspace_electrostatics import RealSpaceFiniteDiffereneEnergy
+from .realspace_electrostatics import (
+    RealSpaceAnalyticalEnergy,
+    RealSpaceFiniteDiffereneEnergy,
+    RealSpaceMethod,
+    _match_tensor_placement,
+)
 from .slabs import slab_dipole_correction_energy, MonopoleDipoleCorrectionBlock
 
 
@@ -56,6 +61,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         kspace_cutoff: float,
         include_self_interaction: bool = False,
         pbc_handling: PBCHandling = "mixed_periodic",
+        realspace_method: RealSpaceMethod = "finite_difference",
     ):
         super().__init__()
         self.density_max_l = density_max_l
@@ -63,6 +69,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         self.kspace_cutoff = kspace_cutoff
         self.include_self_interaction = include_self_interaction
         self.pbc_handling = pbc_handling
+        self.realspace_method = realspace_method
 
         self.density_basis = GTOBasis(
             max_l=density_max_l,
@@ -78,13 +85,24 @@ class GTOElectrostaticEnergy(torch.nn.Module):
             normalize_source="multipoles",
             normalize_receive="multipoles",
         )
-        self.realspace_energy = RealSpaceFiniteDiffereneEnergy(
-            density_max_l=density_max_l,
-            density_smearing_width=density_smearing_width,
-            include_self_interaction=include_self_interaction,
-        )
+        self.realspace_energy = self._build_realspace_energy()
         self.monopole_dipole_correction = MonopoleDipoleCorrectionBlock(density_max_l)
         self._forward_impl = self._select_forward_impl()
+
+    def _build_realspace_energy(self, method=None, *, dtype=None):
+        if method is None:
+            method = getattr(self, "realspace_method", "finite_difference")
+        kwargs = dict(
+            density_max_l=self.density_max_l,
+            density_smearing_width=self.density_smearing_width,
+            include_self_interaction=self.include_self_interaction,
+            dtype=dtype,
+        )
+        if method == "finite_difference":
+            return RealSpaceFiniteDiffereneEnergy(**kwargs)
+        if method == "analytical":
+            return RealSpaceAnalyticalEnergy(**kwargs)
+        raise ValueError(f"Unsupported realspace_method: {method}")
 
     def _select_forward_impl(self) -> Callable:
         if self.pbc_handling == "realspace":
@@ -104,6 +122,26 @@ class GTOElectrostaticEnergy(torch.nn.Module):
     def set_pbc_handling(self, pbc_handling: PBCHandling) -> None:
         self.pbc_handling = pbc_handling
         self._forward_impl = self._select_forward_impl()
+
+    def set_realspace_method(self, realspace_method: RealSpaceMethod) -> None:
+        """Swap the non-periodic evaluator on an already-built block.
+
+        The analytical evaluator is exactly rotationally invariant; the
+        finite-difference one is what existing weights were fitted against, so it
+        stays the default and this setter is the opt-in for an existing model.
+        """
+        old = self.realspace_energy
+        reference = next(
+            buffer for buffer in old.buffers() if buffer.is_floating_point()
+        )
+        replacement = self._build_realspace_energy(
+            realspace_method, dtype=reference.dtype
+        )
+        replacement = _match_tensor_placement(replacement, old)
+        replacement.train(old.training)
+        # Leave the current evaluator and flag unchanged if construction fails.
+        self.realspace_energy = replacement
+        self.realspace_method = realspace_method
 
     def forward(
         self,
