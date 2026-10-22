@@ -93,7 +93,7 @@ class SmearedCoulombKernels(NamedTuple):
     (receiver minus sender) the multipole interaction terms read:
 
         charge-charge     q_s q_r B_0
-        charge-dipole     (q_s (p_r . R) - q_r (p_s . R)) B_1
+        charge-dipole     (q_r (p_s . R) - q_s (p_r . R)) B_1
         dipole-dipole     (p_s . p_r) B_1 - (p_s . R)(p_r . R) B_2
 
     Equivalently B_1 R is the field of a unit charge and B_1 I - B_2 R R^T the
@@ -299,7 +299,10 @@ class RealSpaceFiniteDiffereneEnergy(torch.nn.Module):
         density_smearing_width: float,
         include_self_interaction: bool = False,
         offset=0.02,
+        *,
+        dtype: torch.dtype | None = None,
     ):
+        dtype = dtype if dtype is not None else torch.get_default_dtype()
         if density_max_l > 1:
             raise ValueError(
                 "RealSpaceFiniteDiffereneEnergy only supports l=0 and l=1."
@@ -316,18 +319,13 @@ class RealSpaceFiniteDiffereneEnergy(torch.nn.Module):
             [density_smearing_width],
             "multipoles",
             "multipoles",
+            dtype=dtype,
         )
 
         self.offset = offset
-        self.register_buffer(
-            "x", torch.tensor([offset, 0.0, 0.0], dtype=torch.get_default_dtype())
-        )
-        self.register_buffer(
-            "y", torch.tensor([0.0, offset, 0.0], dtype=torch.get_default_dtype())
-        )
-        self.register_buffer(
-            "z", torch.tensor([0.0, 0.0, offset], dtype=torch.get_default_dtype())
-        )
+        self.register_buffer("x", torch.tensor([offset, 0.0, 0.0], dtype=dtype))
+        self.register_buffer("y", torch.tensor([0.0, offset, 0.0], dtype=dtype))
+        self.register_buffer("z", torch.tensor([0.0, 0.0, offset], dtype=dtype))
 
     def energy_l0(
         self,
@@ -450,7 +448,10 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         include_self_interaction=False,
         integral_normalization="receiver",
         offset: float = 0.1,
+        *,
+        dtype: torch.dtype | None = None,
     ):
+        dtype = dtype if dtype is not None else torch.get_default_dtype()
         super().__init__()
 
         self.density_max_l = density_max_l
@@ -467,10 +468,11 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
             projection_smearing_widths,
             "multipoles",
             integral_normalization,
+            dtype=dtype,
         )
 
         projection_smearing_widths_tensor = torch.tensor(
-            projection_smearing_widths, dtype=torch.get_default_dtype()
+            projection_smearing_widths, dtype=dtype
         )
         total_width_factors = torch.pow(
             (density_smearing_width**2 + projection_smearing_widths_tensor**2) / 2, 0.5
@@ -478,24 +480,16 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         self.register_buffer("total_width_factors", total_width_factors)
 
         self.offset = offset
-        self.register_buffer(
-            "x", torch.tensor([offset, 0.0, 0.0], dtype=torch.get_default_dtype())
-        )
-        self.register_buffer(
-            "y", torch.tensor([0.0, offset, 0.0], dtype=torch.get_default_dtype())
-        )
-        self.register_buffer(
-            "z", torch.tensor([0.0, 0.0, offset], dtype=torch.get_default_dtype())
-        )
+        self.register_buffer("x", torch.tensor([offset, 0.0, 0.0], dtype=dtype))
+        self.register_buffer("y", torch.tensor([0.0, offset, 0.0], dtype=dtype))
+        self.register_buffer("z", torch.tensor([0.0, 0.0, offset], dtype=dtype))
 
         l0_factors = [
             get_Cl_sigma(0, sigma, normalize=integral_normalization)
             / get_Cl_sigma(0, sigma, normalize="multipoles")
             for sigma in projection_smearing_widths
         ]
-        self.register_buffer(
-            "l0_factors", torch.tensor(l0_factors, dtype=torch.get_default_dtype())
-        )
+        self.register_buffer("l0_factors", torch.tensor(l0_factors, dtype=dtype))
         l1_factors = [
             3**0.5
             * sigma**2
@@ -506,9 +500,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
             / self.offset
             for sigma in projection_smearing_widths
         ]
-        self.register_buffer(
-            "l1_factors", torch.tensor(l1_factors, dtype=torch.get_default_dtype())
-        )
+        self.register_buffer("l1_factors", torch.tensor(l1_factors, dtype=dtype))
 
     def call_density_0_feats_0(
         self,
@@ -668,7 +660,10 @@ class RealSpaceAnalyticalEnergy(torch.nn.Module):
         density_max_l: int,
         density_smearing_width: float,
         include_self_interaction: bool = False,
+        *,
+        dtype: torch.dtype | None = None,
     ):
+        dtype = dtype if dtype is not None else torch.get_default_dtype()
         super().__init__()
         if density_max_l not in (0, 1):
             raise ValueError("RealSpaceAnalyticalEnergy only supports l=0 and l=1.")
@@ -689,6 +684,7 @@ class RealSpaceAnalyticalEnergy(torch.nn.Module):
             [density_smearing_width],
             "multipoles",
             "multipoles",
+            dtype=dtype,
         )
 
     def forward(
@@ -787,7 +783,10 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
         projection_smearing_widths: list[float],
         include_self_interaction: bool = False,
         integral_normalization: str = "receiver",
+        *,
+        dtype: torch.dtype | None = None,
     ):
+        dtype = dtype if dtype is not None else torch.get_default_dtype()
         super().__init__()
         if density_max_l not in (0, 1) or projection_max_l not in (0, 1):
             raise ValueError(
@@ -818,6 +817,7 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
             projection_smearing_widths,
             "multipoles",
             integral_normalization,
+            dtype=dtype,
         )
 
         combined_smearing_widths = torch.tensor(
@@ -825,7 +825,7 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
                 math.sqrt(density_smearing_width**2 + projection_width**2)
                 for projection_width in projection_smearing_widths
             ],
-            dtype=torch.get_default_dtype(),
+            dtype=dtype,
         )
         self.register_buffer(
             "combined_smearing_widths", combined_smearing_widths, persistent=False
@@ -842,7 +842,7 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
         ]
         self.register_buffer(
             "l0_factors",
-            torch.tensor(l0_factors, dtype=torch.get_default_dtype()),
+            torch.tensor(l0_factors, dtype=dtype),
             persistent=False,
         )
         if projection_max_l >= 1:
@@ -853,7 +853,7 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
             ]
             self.register_buffer(
                 "l1_factors",
-                torch.tensor(l1_factors, dtype=torch.get_default_dtype()),
+                torch.tensor(l1_factors, dtype=dtype),
                 persistent=False,
             )
 
@@ -934,7 +934,9 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
                 * gradient_features
             )
             vector_features = gradient_features[..., CARTESIAN_TO_E3NN_COMPONENTS]
-            feature_blocks.append(vector_features.reshape(num_nodes, -1))
+            feature_blocks.append(
+                vector_features.reshape(num_nodes, 3 * self.num_radial)
+            )
 
         features = torch.cat(feature_blocks, dim=-1)
 

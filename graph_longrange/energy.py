@@ -89,22 +89,19 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         self.monopole_dipole_correction = MonopoleDipoleCorrectionBlock(density_max_l)
         self._forward_impl = self._select_forward_impl()
 
-    def _build_realspace_energy(self) -> torch.nn.Module:
-        # getattr keeps this working for whole-model pickles written before the
-        # flag existed: those restore their __dict__ without calling __init__.
-        method = getattr(self, "realspace_method", "finite_difference")
+    def _build_realspace_energy(self, method=None, *, dtype=None):
+        if method is None:
+            method = getattr(self, "realspace_method", "finite_difference")
+        kwargs = dict(
+            density_max_l=self.density_max_l,
+            density_smearing_width=self.density_smearing_width,
+            include_self_interaction=self.include_self_interaction,
+            dtype=dtype,
+        )
         if method == "finite_difference":
-            return RealSpaceFiniteDiffereneEnergy(
-                density_max_l=self.density_max_l,
-                density_smearing_width=self.density_smearing_width,
-                include_self_interaction=self.include_self_interaction,
-            )
+            return RealSpaceFiniteDiffereneEnergy(**kwargs)
         if method == "analytical":
-            return RealSpaceAnalyticalEnergy(
-                density_max_l=self.density_max_l,
-                density_smearing_width=self.density_smearing_width,
-                include_self_interaction=self.include_self_interaction,
-            )
+            return RealSpaceAnalyticalEnergy(**kwargs)
         raise ValueError(f"Unsupported realspace_method: {method}")
 
     def _select_forward_impl(self) -> Callable:
@@ -133,10 +130,18 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         finite-difference one is what existing weights were fitted against, so it
         stays the default and this setter is the opt-in for an existing model.
         """
-        self.realspace_method = realspace_method
-        self.realspace_energy = _match_tensor_placement(
-            self._build_realspace_energy(), self.realspace_energy
+        old = self.realspace_energy
+        reference = next(
+            buffer for buffer in old.buffers() if buffer.is_floating_point()
         )
+        replacement = self._build_realspace_energy(
+            realspace_method, dtype=reference.dtype
+        )
+        replacement = _match_tensor_placement(replacement, old)
+        replacement.train(old.training)
+        # Leave the current evaluator and flag unchanged if construction fails.
+        self.realspace_energy = replacement
+        self.realspace_method = realspace_method
 
     def forward(
         self,

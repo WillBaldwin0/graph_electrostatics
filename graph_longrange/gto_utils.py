@@ -239,6 +239,8 @@ class GTOSelfInteractionBlock(torch.nn.Module):
         sigmas_receive: List[float],
         normalize_source: str,
         normalize_receive: str,
+        *,
+        dtype: torch.dtype | None = None,
     ):
         super().__init__()
 
@@ -277,7 +279,7 @@ class GTOSelfInteractionBlock(torch.nn.Module):
                     ] = (Cl_source * Cl_receive * prefactor * value)
 
         overlap_constants = torch.from_numpy(overlap_constants).to(
-            torch.get_default_dtype()
+            dtype if dtype is not None else torch.get_default_dtype()
         )
         self.register_buffer(
             "overlap_constants",

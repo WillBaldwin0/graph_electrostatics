@@ -335,3 +335,59 @@ def test_state_dict_round_trip_within_one_method(realspace_method):
         run_energy_block(reloaded, source_feats, positions, batch),
         run_energy_block(block, source_feats, positions, batch),
     )
+
+
+BLOCKS = [
+    (make_energy_block, run_energy_block, "realspace_energy"),
+    (make_features_block, run_features_block, "realspace_features"),
+]
+
+
+
+@pytest.mark.parametrize("factory,runner,attribute", BLOCKS)
+@pytest.mark.parametrize("method", ["finite_difference", "analytical"])
+def test_switch_preserves_float64_precision_under_float32_default(
+    factory, runner, attribute, method
+):
+    old_default = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        expected = factory(realspace_method=method)
+        opposite = (
+            "analytical" if method == "finite_difference" else "finite_difference"
+        )
+        switched = factory(realspace_method=opposite).eval()
+        feats, positions, batch = random_system()
+        torch.set_default_dtype(torch.float32)
+        switched.set_realspace_method(method)
+        expected_buffers = dict(getattr(expected, attribute).named_buffers())
+        for name, buffer in getattr(switched, attribute).named_buffers():
+            torch.testing.assert_close(buffer, expected_buffers[name], rtol=0, atol=0)
+        assert not getattr(switched, attribute).training
+        torch.testing.assert_close(
+            runner(switched, feats, positions, batch),
+            runner(expected, feats, positions, batch),
+            rtol=0,
+            atol=0,
+        )
+    finally:
+        torch.set_default_dtype(old_default)
+
+
+@pytest.mark.parametrize("factory,runner,attribute", BLOCKS)
+def test_failed_switch_does_not_change_state(factory, runner, attribute, monkeypatch):
+    block = factory(realspace_method="analytical")
+    previous = getattr(block, attribute)
+    with pytest.raises(ValueError, match="Unsupported realspace_method"):
+        block.set_realspace_method("invalid")
+    assert getattr(block, attribute) is previous
+    assert block.realspace_method == "analytical"
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("construction failed")
+
+    monkeypatch.setattr(block, "_build_" + attribute, fail)
+    with pytest.raises(RuntimeError, match="construction failed"):
+        block.set_realspace_method("finite_difference")
+    assert getattr(block, attribute) is previous
+    assert block.realspace_method == "analytical"

@@ -916,3 +916,23 @@ def test_invalid_configuration_raises():
         RealSpaceAnalyticalEnergy(0, DENSITY_SMEARING_WIDTH)(
             source_feats, positions, batch
         )
+
+
+@pytest.mark.parametrize("density_l,projection_l", [(0, 0), (0, 1), (1, 0), (1, 1)])
+@pytest.mark.parametrize("include_self", [False, True])
+def test_empty_analytical_features(density_l, projection_l, include_self):
+    module = RealSpaceAnalyticalElectrostaticFeatures(
+        density_l,
+        DENSITY_SMEARING_WIDTH,
+        projection_l,
+        PROJECTION_SMEARING_WIDTHS,
+        include_self_interaction=include_self,
+    )
+    features, self_terms, _ = module(
+        torch.empty((0, (density_l + 1) ** 2)),
+        torch.empty((0, 3)),
+        torch.empty(0, dtype=torch.long),
+    )
+    expected_shape = (0, len(PROJECTION_SMEARING_WIDTHS) * (projection_l + 1) ** 2)
+    assert features.shape == expected_shape
+    assert self_terms.shape == expected_shape

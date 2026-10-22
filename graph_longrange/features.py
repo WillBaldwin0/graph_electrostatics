@@ -342,28 +342,24 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         self._precompute_geometry_impl = self._select_precompute_geometry_impl()
         self._forward_dynamic_impl = self._select_forward_dynamic_impl()
 
-    def _build_realspace_features(self) -> torch.nn.Module:
-        """Build the non-periodic evaluator selected by self.realspace_method.
-
-        The constructor arguments are read back off the GTO bases rather than
-        stored again, so this also works on whole-model pickles written before
-        the flag existed: those restore their __dict__ without calling __init__.
-        """
-        method = getattr(self, "realspace_method", "finite_difference")
-        if method == "finite_difference":
-            module_class = RealSpaceFiniteDifferenceElectrostaticFeatures
-        elif method == "analytical":
-            module_class = RealSpaceAnalyticalElectrostaticFeatures
-        else:
-            raise ValueError(f"Unsupported realspace_method: {method}")
-        return module_class(
+    def _build_realspace_features(self, method=None, *, dtype=None):
+        # Read configuration from the bases, including on old whole-model pickles.
+        if method is None:
+            method = getattr(self, "realspace_method", "finite_difference")
+        kwargs = dict(
             density_max_l=self.density_basis.max_l,
             density_smearing_width=self.density_basis.sigmas[0],
             projection_max_l=self.feature_basis.max_l,
             projection_smearing_widths=self.feature_basis.sigmas,
             include_self_interaction=self.include_self_interaction,
             integral_normalization=self.feature_basis.normalize,
+            dtype=dtype,
         )
+        if method == "finite_difference":
+            return RealSpaceFiniteDifferenceElectrostaticFeatures(**kwargs)
+        if method == "analytical":
+            return RealSpaceAnalyticalElectrostaticFeatures(**kwargs)
+        raise ValueError(f"Unsupported realspace_method: {method}")
 
     @staticmethod
     def _build_output_permutation(max_l: int, n_radial: int) -> torch.Tensor:
@@ -420,10 +416,18 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         finite-difference one is what existing weights were fitted against, so it
         stays the default and this setter is the opt-in for an existing model.
         """
-        self.realspace_method = realspace_method
-        self.realspace_features = _match_tensor_placement(
-            self._build_realspace_features(), self.realspace_features
+        old = self.realspace_features
+        reference = next(
+            buffer for buffer in old.buffers() if buffer.is_floating_point()
         )
+        replacement = self._build_realspace_features(
+            realspace_method, dtype=reference.dtype
+        )
+        replacement = _match_tensor_placement(replacement, old)
+        replacement.train(old.training)
+        # Leave the current evaluator and flag unchanged if construction fails.
+        self.realspace_features = replacement
+        self.realspace_method = realspace_method
 
     def forward(
         self,
